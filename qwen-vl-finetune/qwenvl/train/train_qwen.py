@@ -41,8 +41,20 @@ from qwenvl.train.argument import (
 )
 from transformers import AutoProcessor, Trainer
 
+import time
+
+from torch.distributed import init_process_group
+from torch.utils.data import DataLoader
+from torch.distributed.elastic.multiprocessing.errors import record
+
+from torchtitan.tools.logging import init_logger, logger
+from torchtitan.tools.utils import Color
+
+torch._dynamo.config.capture_scalar_outputs = True
+
 local_rank = None
 
+LOCAL_BATCH_SIZE = 2
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -88,119 +100,193 @@ def set_model(model_args, model):
             p.requires_grad = False
         model.lm_head.requires_grad = False
 
-
-def train(attn_implementation="flash_attention_2"):
-    global local_rank
-
-    parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments)
+def loss_fn(pred, labels):
+    print(pred.shape, labels.shape)
+    return torch.nn.functional.cross_entropy(
+        pred.flatten(0, 1).float(), labels.flatten(0, 1)
     )
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    local_rank = training_args.local_rank
-    os.makedirs(training_args.output_dir, exist_ok=True)
 
-    if "qwen3" in model_args.model_name_or_path.lower() and "a" in Path(model_args.model_name_or_path.rstrip("/")).name.lower():
-        model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
+class Trainer(torch.distributed.checkpoint.stateful.Stateful):
+
+    @record
+    def __init__(self, *args, **kwargs):
+        self.device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+        world_size = int(os.environ['WORLD_SIZE'])
+
+        attn_implementation = "flash_attention_2"
+
+        logger.info("starting finetune job")
+        logger.info(f"world size: {world_size}")
+
+        local_rank = int(os.environ['LOCAL_RANK']) 
+
+        parser = transformers.HfArgumentParser(
+            (ModelArguments, DataArguments, TrainingArguments)
+        )
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+        self.model_args = model_args
+        self.data_args = data_args
+        self.training_args = training_args
+
+        os.makedirs(training_args.output_dir, exist_ok=True)
+
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             dtype=(torch.bfloat16 if training_args.bf16 else None),
         )
         data_args.model_type = "qwen3vl"
-    elif "qwen3" in model_args.model_name_or_path.lower():
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
+
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
-            dtype=(torch.bfloat16 if training_args.bf16 else None),
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+            use_fast=False,
         )
-        data_args.model_type = "qwen3vl"
-    elif "qwen2.5" in model_args.model_name_or_path.lower():
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+
+        self.processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
-            dtype=(torch.bfloat16 if training_args.bf16 else None),
         )
-        data_args.model_type = "qwen2.5vl"
-    else:
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
-            dtype=(torch.bfloat16 if training_args.bf16 else None),
-        )
-        data_args.model_type = "qwen2vl"
 
-    print(f'the initlized model is {model_args.model_name_or_path} the class is {model.__class__.__name__}')
-    processor = AutoProcessor.from_pretrained(
-        model_args.model_name_or_path,
-    )
+        set_model(model_args, self.model)
 
-    if data_args.data_flatten or data_args.data_packing:
-        replace_qwen2_vl_attention_class()
-    model.config.use_cache = False
-
-    if training_args.gradient_checkpointing:
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-        else:
-
-            def make_inputs_require_grad(module, input, output):
-                output.requires_grad_(True)
-
-            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
-
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-        model_max_length=training_args.model_max_length,
-        padding_side="right",
-        use_fast=False,
-    )
-
-    if training_args.lora_enable:
-        from peft import LoraConfig, get_peft_model, TaskType
-        print("LoRA enabled")
-
-        for p in model.parameters():
-            p.requires_grad = False
-
-        lora_config = LoraConfig(
-            r=training_args.lora_r or 64,
-            lora_alpha=training_args.lora_alpha or 128,
-            lora_dropout=training_args.lora_dropout or 0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # Qwen 的 attention 线性层
-            bias="none",
-            task_type=TaskType.CAUSAL_LM,
-        )
-        model = get_peft_model(model, lora_config)
-    else:
-        set_model(model_args, model)
-
-        if torch.distributed.get_rank() == 0:
-            model.visual.print_trainable_parameters()
-            model.model.print_trainable_parameters()
+        """
+        if local_rank == 0:
+            self.model.visual.print_trainable_parameters()
+            self.model.model.print_trainable_parameters()
+        """
     
-    data_module = make_supervised_data_module(processor, data_args=data_args)
-    trainer = Trainer(
-        model=model, processing_class=tokenizer, args=training_args, **data_module
-    )
+        self.data_module = make_supervised_data_module(self.processor, data_args=data_args)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        logging.info("checkpoint found, resume training")
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
-    trainer.save_state()
+        dataset = self.data_module['train_dataset']
+        collator = self.data_module['data_collator']
 
-    model.config.use_cache = True
+        self.sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=local_rank,
+            shuffle=True,
+        )
 
-    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-    
-    processor.save_pretrained(training_args.output_dir)
+        self.data_loader = DataLoader(
+            dataset,
+            batch_size=LOCAL_BATCH_SIZE,
+            collate_fn=collator,
+            num_workers=64,
+            pin_memory=True,
+            persistent_workers=True,
 
+        )
+
+        self.model.to(self.device)
+
+        #self.model = torch.compile(self.model)
+
+        self.step = 0
+        self.tokens_seen = 0
+        self.ntokens_since_last_log = 0
+        self.time_last_log = time.perf_counter()
+        self.color = Color()
+
+        self.optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=training_args.learning_rate,
+            weight_decay=training_args.weight_decay,
+        )
+
+    def batch_generator(self, data_module):
+        data_iter = iter(self.data_loader)
+
+        while True:
+            data_start_time = time.perf_counter()
+            try:
+                batch = next(data_iter)
+
+            except StopIteration:
+                raise Exception("DataLoader ran out of data.")
+
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(self.device, non_blocking=True)
+
+            labels = batch.pop("labels")
+            _ = batch.pop("attention_mask", None)
+
+            ntokens_batch = labels.numel()
+            self.tokens_seen += ntokens_batch
+            self.ntokens_since_last_log += ntokens_batch
+
+            self.data_time_delta = time.perf_counter() - data_start_time
+
+            yield batch, labels
+
+    def log(self, global_loss):
+
+        time_delta = time.perf_counter() - self.time_last_log
+
+        tps = self.ntokens_since_last_log / time_delta
+
+        color = self.color
+
+        data_time_pct = (self.data_time_delta / time_delta) * 100
+
+        logger.info(
+            f"{color.red}step {self.step} "
+            f"{color.green}loss {global_loss:.4f} "
+            f"{color.blue}tps {tps:.2f} "
+            f"{color.reset}"
+            f"time_delta {self.train_step_delta:.2f}s "
+            f"data_time_pct {data_time_pct:.2f}%"
+        )
+
+        self.ntokens_since_last_log = 0
+        self.time_last_log = time.perf_counter()
+
+    def train_step(self, data_iterator):
+        self.optimizer.zero_grad()
+        batch, labels = next(data_iterator)
+        # we use the labels directly
+
+        for _ in range(self.training_args.gradient_accumulation_steps):
+            with torch.autocast("cuda", torch.bfloat16):
+                outputs = self.model(
+                    labels=labels,
+                    **batch
+                )
+                loss = outputs.loss
+            total_loss = loss / self.training_args.gradient_accumulation_steps
+            loss.backward()
+
+        if self.training_args.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.training_args.max_grad_norm
+            )
+        self.optimizer.step()
+        self.train_step_delta = time.perf_counter() - self.time_last_log
+
+        self.log(total_loss.item())
+
+
+    def train(self):
+        data_iterator = self.batch_generator(self.data_module)
+
+        try:
+            while True:
+                self.step += 1
+                self.train_step(data_iterator)
+        except Exception as e:
+            logger.info(f"exception: {e}")
+
+
+        logger.info(f"tokens seen: {self.tokens_seen}")
+        logger.info("Training completed")
 
 if __name__ == "__main__":
-    train(attn_implementation="flash_attention_2")
+    init_logger()
+
+    trainer = Trainer()
+    trainer.train()

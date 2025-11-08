@@ -248,6 +248,8 @@ class LazySupervisedDataset(Dataset):
         super(LazySupervisedDataset, self).__init__()
 
         dataset = data_args.dataset_use.split(",")
+
+        dataset = ['finevision']
         dataset_list = data_list(dataset)
         rank0_print(f"Loading datasets: {dataset_list}")
         self.video_max_total_pixels = getattr(
