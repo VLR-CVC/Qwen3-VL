@@ -11,7 +11,7 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="Qwen/Qwen2.5-VL-3B-Instruct"  # [ModelArguments] Pretrained model path
+MODEL_PATH="Qwen/Qwen3-VL-2B-Instruct"  # [ModelArguments] Pretrained model path
 OUTPUT_DIR="/data/users/tockier/qwen_finetune/checkpoints"                   # Directory for saving checkpoints
 CACHE_DIR="/data/users/tockier/qwen_finetune/cache"                          # [TrainingArguments] Cache directory for models
 

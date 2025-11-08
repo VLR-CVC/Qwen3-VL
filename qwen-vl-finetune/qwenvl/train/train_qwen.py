@@ -27,13 +27,8 @@ sys.path.append(str(project_root))
 
 from trainer import replace_qwen2_vl_attention_class
 
-from transformers import (
-    Qwen2VLForConditionalGeneration,
-    Qwen2_5_VLForConditionalGeneration,
-    Qwen3VLForConditionalGeneration,
-    Qwen3VLMoeForConditionalGeneration
-)
 from qwenvl.data.data_processor import make_supervised_data_module
+from qwenvl.train.utils import select_model_class
 from qwenvl.train.argument import (
     ModelArguments,
     DataArguments,
@@ -43,6 +38,8 @@ from transformers import AutoProcessor, Trainer
 
 import time
 
+from enum import Enum
+
 from torch.distributed import init_process_group
 from torch.utils.data import DataLoader
 from torch.distributed.elastic.multiprocessing.errors import record
@@ -50,7 +47,6 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import Color
 
-torch._dynamo.config.capture_scalar_outputs = True
 
 local_rank = None
 
@@ -100,6 +96,7 @@ def set_model(model_args, model):
             p.requires_grad = False
         model.lm_head.requires_grad = False
 
+
 def loss_fn(pred, labels):
     print(pred.shape, labels.shape)
     return torch.nn.functional.cross_entropy(
@@ -126,19 +123,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+        os.makedirs(training_args.output_dir, exist_ok=True)
+
+        self.model, data_args = select_model_class(model_args, data_args, training_args, attn_implementation)
+
         self.model_args = model_args
         self.data_args = data_args
         self.training_args = training_args
-
-        os.makedirs(training_args.output_dir, exist_ok=True)
-
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
-            dtype=(torch.bfloat16 if training_args.bf16 else None),
-        )
-        data_args.model_type = "qwen3vl"
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
@@ -154,12 +145,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         set_model(model_args, self.model)
 
-        """
-        if local_rank == 0:
-            self.model.visual.print_trainable_parameters()
-            self.model.model.print_trainable_parameters()
-        """
-    
         self.data_module = make_supervised_data_module(self.processor, data_args=data_args)
 
         dataset = self.data_module['train_dataset']
