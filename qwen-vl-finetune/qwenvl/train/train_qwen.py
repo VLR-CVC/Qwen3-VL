@@ -18,14 +18,14 @@ import os
 import logging
 import pathlib
 import torch
+import wandb
 import transformers
 import sys
 from pathlib import Path
+from tqdm import tqdm
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
-
-from trainer import replace_qwen2_vl_attention_class
 
 from qwenvl.data.data_processor import make_supervised_data_module
 from qwenvl.train.utils import select_model_class
@@ -34,11 +34,9 @@ from qwenvl.train.argument import (
     DataArguments,
     TrainingArguments,
 )
-from transformers import AutoProcessor, Trainer
+from transformers import AutoProcessor
 
 import time
-
-from enum import Enum
 
 from torch.distributed import init_process_group
 from torch.utils.data import DataLoader
@@ -49,20 +47,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import Color
 
-
-def save_model(trainer, output_dir):
-    """Collects the state dict and dump to disk."""
-    state_dict = trainer.model.state_dict()
-    cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-    del state_dict
-    step = trainer.step
-
-    checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step:06d}")
-
-    if not os.path.exists(checkpoint_dir):
-        pathlib.Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-
-    torch.save(cpu_state_dict, os.path.join(checkpoint_dir, "model.pt"))
+from safetensors.torch import save_file
 
 
 def compile_model(model: torch.nn.Module):
@@ -138,8 +123,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         attn_implementation = "flash_attention_2"
         logger.info("starting finetune job")
 
-        torch.distributed.init_process_group(backend="nccl")
-
         local_rank = int(os.environ["LOCAL_RANK"])
 
         parser = transformers.HfArgumentParser(
@@ -147,14 +130,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+        wandb.init(
+            project="qwen-vl-finetune",
+            config={
+                **vars(model_args),
+                **vars(data_args),
+                **vars(training_args),
+            },
+        )
+
         os.makedirs(training_args.output_dir, exist_ok=True)
 
         self.model, data_args = select_model_class(model_args, data_args, training_args, attn_implementation)
+        self.optimizer = None
 
         self.device = torch.device(f"cuda:{local_rank}")
 
-        compile_model(self.model.to(self.device).to(torch.bfloat16))
-        logger.info("model compiled with torch.compile")
+        if False:
+            compile_model(self.model.to(self.device).to(torch.bfloat16))
+            logger.info("model compiled with torch.compile")
 
         self.model_args = model_args
         self.data_args = data_args
@@ -173,6 +167,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         set_model(model_args, self.model)
+
+        self.model.to(self.device)
 
         self.data_module = make_supervised_data_module(self.processor, data_args=data_args)
 
@@ -196,14 +192,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             sampler=self.sampler,
         )
 
-        self.model.to(self.device)
-
-        self.optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=training_args.learning_rate,
-            weight_decay=training_args.weight_decay,
-        )
-
         self.step = 0
         self.tokens_seen = 0
         self.tokens_seen_assistant = 0
@@ -211,10 +199,65 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.time_last_log = time.perf_counter()
         self.color = Color()
 
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+
+        lr_mlp = self.training_args.mm_projector_lr
+        lr_vision = self.training_args.vision_tower_lr
+        lr_llm = self.training_args.learning_rate
+
+        mlp_params = []
+        vision_params = []
+        llm_params = []
+
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "visual.merger" in n:
+                mlp_params.append(p)
+            elif "visual.patch_embed" in n:
+                vision_params.append(p)
+            elif "visual.blocks" in n:
+                vision_params.append(p)
+            else:
+                llm_params.append(p)
+
+        optimizer_grouped_parameters = [
+            {
+                "params": mlp_params,
+                "lr": lr_mlp,
+            },
+            {
+                "params": vision_params,
+                "lr": lr_vision,
+            },
+            {
+                "params": llm_params,
+                "lr": lr_llm,
+            },
+        ]
+
+        # TODO: add weight decay exclusion for bias and LayerNorm
+        #no_decay = ["bias", "LayerNorm.weight"]
+
+        self.optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr_llm, weight_decay=self.training_args.weight_decay)
+
+        return self.optimizer
+
     def save_checkpoint(self):
-        logger.info(f"Saving checkpoint at step {self.step}...")
-        save_model(self, self.training_args.output_dir)
-        logger.info("Checkpoint saved!!!")
+        step = self.step
+
+        checkpoint_dir = os.path.join(self.training_args.output_dir, f"checkpoint-{step:06d}")
+        if not os.path.exists(checkpoint_dir):
+            pathlib.Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+        weights_path = os.path.join(checkpoint_dir, "model.pt")
+
+        state_dict = self.model.state_dict()
+        torch.save(state_dict, weights_path)
+
+        logger.info(f"Saved checkpoint to {checkpoint_dir}")
 
     def may_save(self):
         if self.step % self.training_args.save_steps == 0:
@@ -269,6 +312,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"data_time_pct {data_time_pct:.2f}%"
         )
 
+        log_metrics = {
+            "train/loss": global_loss,
+            "train/tokens_per_second": tps,
+            "train/step_time": self.train_step_delta,
+            "train/data_time_pct": data_time_pct,
+            "train/tokens_seen": self.tokens_seen,
+            "train/assistant_tokens_seen": self.tokens_seen_assistant,
+        }
+
+        wandb.log(log_metrics, step=self.step)
+
         self.ntokens_since_last_log = 0
         self.time_last_log = time.perf_counter()
 
@@ -299,6 +353,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     def train(self):
         data_iterator = self.batch_generator(self.data_module)
+        self.optimizer = self.create_optimizer()
 
         try:
             while True:
@@ -308,8 +363,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 if self.may_save():
                     self.save_checkpoint()
 
-        except Exception as e:
-            logger.info(f"exception: {e}")
         except KeyboardInterrupt:
             logger.info("keyboard interrupt received...")
 
