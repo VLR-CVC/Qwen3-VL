@@ -19,6 +19,7 @@
 ### TODOs 🚧🛠️🎯
 - [x] checkpoints
 - [x] compile
+- [ ] deterministic
 - [ ] better args + config
 - [ ] data parallel
 - [ ] FSDP
