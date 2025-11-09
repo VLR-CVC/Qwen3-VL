@@ -1,28 +1,11 @@
-# Adopted from https://github.com/lm-sys/FastChat. Below is the original copyright:
-# Adopted from tatsu-lab@stanford_alpaca. Below is the original copyright:
-#    Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li
-#
-#    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
-#
-#        http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#    See the License for the specific language governing permissions and
-#    limitations under the License.
-
 import os
-import logging
 import pathlib
 import torch
 import wandb
 import transformers
+import random
 import sys
 from pathlib import Path
-from tqdm import tqdm
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
@@ -38,17 +21,32 @@ from transformers import AutoProcessor
 
 import time
 
-from torch.distributed import init_process_group
 from torch.utils.data import DataLoader
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed._composable import replicate
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard as FSDP
+import torch.distributed.distributed_c10d as c10d
 
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import Color
 
-from safetensors.torch import save_file
+def set_determinism(
+        world_mesh,
+        seed: int | None = None,
+        deterministic: bool = True,
+) -> None:
+    if deterministic:
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
+    random.seed(seed or 42)
+    torch.manual_seed(seed or 42)
+    os.environ["PYTHONHASHSEED"] = str(seed % 2**32)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+    torch.distributed.tensor._random.manual_seed(seed, world_mesh)
 
 def compile_model(model: torch.nn.Module):
     model.visual = torch.compile(
@@ -121,34 +119,53 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def __init__(self, *args, **kwargs):
         attn_implementation = "flash_attention_2"
-        logger.info("starting finetune job")
 
         local_rank = int(os.environ["LOCAL_RANK"])
+
+
+        self.mesh = init_device_mesh(
+            "cuda",
+            (4,),
+            mesh_dim_names=("shard",),
+        )
+
+        if self.if_log_rank():
+            logger.info("starting finetune job")
+            logger.info(f"mesh: {self.mesh}")
+
+        set_determinism(seed=42 + local_rank, deterministic=True, world_mesh=self.mesh)
 
         parser = transformers.HfArgumentParser(
             (ModelArguments, DataArguments, TrainingArguments)
         )
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-        wandb.init(
-            project="qwen-vl-finetune",
-            config={
-                **vars(model_args),
-                **vars(data_args),
-                **vars(training_args),
-            },
-        )
+        if self.if_log_rank():
+            wandb.init(
+                project="qwen-vl-finetune",
+                config={
+                    **vars(model_args),
+                    **vars(data_args),
+                    **vars(training_args),
+                },
+            )
 
         os.makedirs(training_args.output_dir, exist_ok=True)
 
         self.model, data_args = select_model_class(model_args, data_args, training_args, attn_implementation)
-        self.optimizer = None
+        self.optimizer = None # its defined later on
 
         self.device = torch.device(f"cuda:{local_rank}")
 
         if False:
             compile_model(self.model.to(self.device).to(torch.bfloat16))
             logger.info("model compiled with torch.compile")
+
+        if True:
+            self.model = FSDP(
+                self.model.to(self.device).to(torch.bfloat16),
+                mesh=self.mesh,
+            )
 
         self.model_args = model_args
         self.data_args = data_args
@@ -179,7 +196,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             dataset,
             num_replicas=torch.distributed.get_world_size(),
             rank=torch.distributed.get_rank(),
-            shuffle=True,
+            shuffle=False,
+            seed=42,
         )
 
         self.data_loader = DataLoader(
@@ -190,6 +208,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             pin_memory=True,
             persistent_workers=True,
             sampler=self.sampler,
+            worker_init_fn=random.seed,
         )
 
         self.step = 0
@@ -198,6 +217,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.ntokens_since_last_log = 0
         self.time_last_log = time.perf_counter()
         self.color = Color()
+
+    def if_log_rank(self):
+        return torch.distributed.get_rank() == 0
 
     def create_optimizer(self):
         if self.optimizer is not None:
@@ -331,15 +353,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         batch, labels = next(data_iterator)
         # we use the labels directly
 
-        for _ in range(self.training_args.gradient_accumulation_steps):
+        accumulated_losses = []
+        for _microbatch in range(self.training_args.gradient_accumulation_steps):
             with torch.autocast("cuda", torch.bfloat16):
                 outputs = self.model(
                     labels=labels,
                     **batch
                 )
                 loss = outputs.loss
-            total_loss = loss / self.training_args.gradient_accumulation_steps
-            total_loss.backward()
+                loss.backward()
+            accumulated_losses.append(loss.detach())
+
+        loss = torch.sum(torch.stack(accumulated_losses))
 
         if self.training_args.max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(
@@ -348,7 +373,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.optimizer.step()
         self.train_step_delta = time.perf_counter() - self.time_last_log
 
-        self.log(total_loss.item())
+        if self.if_log_rank():
+            self.log(loss.item())
 
 
     def train(self):
@@ -362,16 +388,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                 if self.may_save():
                     self.save_checkpoint()
+        except StopIteration:
+            logger.info("data iterator exhausted...")
 
+        except Exception as e:
+            logger.info(f"exception during training: {e}")
+        
         except KeyboardInterrupt:
             logger.info("keyboard interrupt received...")
 
-        logger.info(f"tokens seen: {self.tokens_seen}")
-        logger.info(f"assistant tokens seen: {self.tokens_seen_assistant}")
-        logger.info("Training completed")
+        if self.if_log_rank():
+            logger.info(f"tokens seen: {self.tokens_seen}")
+            logger.info(f"assistant tokens seen: {self.tokens_seen_assistant}")
+            logger.info("Training completed")
+
+        torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
     init_logger()
+
+    torch.manual_seed(42)
 
     trainer = Trainer()
     trainer.train()

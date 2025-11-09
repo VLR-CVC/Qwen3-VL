@@ -19,7 +19,7 @@ CACHE_DIR="/data/users/tockier/qwen_finetune/cache"                          # [
 # Model Configuration
 # ======================
 DATASETS="finevision"
-NGPUS=1
+NGPUS=4
 
 echo "finetuning qwen vl model from $MODEL_PATH on datasets: $DATASETS"
 
@@ -39,23 +39,17 @@ torchrun --nproc_per_node=$NGPUS \
          --cache_dir $CACHE_DIR \
          --bf16 \
          --per_device_train_batch_size 1 \
-         --gradient_accumulation_steps 2 \
+         --gradient_accumulation_steps 1 \
          --learning_rate 2e-7 \
          --mm_projector_lr 1e-5 \
          --vision_tower_lr 1e-6 \
          --optim adamw_torch \
          --model_max_length 2048 \
-         --data_packing False \
+         --data_packing True \
          --max_pixels 451584 \
          --min_pixels 12544 \
-         --video_fps 2 \
-         --video_max_frames 8 \
-         --video_min_frames 4 \
-         --num_train_epochs 3 \
-         --warmup_ratio 0.03 \
-         --lr_scheduler_type "cosine" \
          --weight_decay 0.01 \
-         --save_steps 500 \
+         --save_steps 100 \
          --save_total_limit 3 \
 
          # Advanced Options
