@@ -16,13 +16,15 @@
 - Using finevision (local path already in)
 - Just run `./finetune.sh`
 
-### TODOs 🚧🛠️🎯
+### TODOs 2.5VL 🚧🛠️🎯
 - [x] checkpoints
 - [x] compile
-- [ ] deterministic
+- [x] deterministic
 - [ ] better args + config
-- [ ] data parallel
-- [ ] FSDP
+- [x] data parallel
+- [x] FSDP
+- [ ] compile + checkpoints
+- [ ] static shape compile
 - [ ] FSDP multinode
 
 
