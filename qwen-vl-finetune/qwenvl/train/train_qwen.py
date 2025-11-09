@@ -58,7 +58,11 @@ def save_model(trainer, output_dir):
     step = trainer.step
 
     checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step:06d}")
-    torch.save(cpu_state_dict, os.path.join(checkpoint_dir, "pytorch_model.bin"))
+
+    if not os.path.exists(checkpoint_dir):
+        pathlib.Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+    torch.save(cpu_state_dict, os.path.join(checkpoint_dir, "model.pt"))
 
 
 def compile_model(model: torch.nn.Module):
@@ -207,6 +211,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.time_last_log = time.perf_counter()
         self.color = Color()
 
+    def save_checkpoint(self):
+        logger.info(f"Saving checkpoint at step {self.step}...")
+        save_model(self, self.training_args.output_dir)
+        logger.info("Checkpoint saved!!!")
+
+    def may_save(self):
+        if self.step % self.training_args.save_steps == 0:
+            return True
+        return False
+
     def batch_generator(self, data_module):
         data_iter = iter(self.data_loader)
 
@@ -290,6 +304,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             while True:
                 self.step += 1
                 self.train_step(data_iterator)
+
+                if self.may_save():
+                    self.save_checkpoint()
+
         except Exception as e:
             logger.info(f"exception: {e}")
         except KeyboardInterrupt:

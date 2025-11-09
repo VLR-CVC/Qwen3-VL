@@ -16,11 +16,9 @@
 - Using finevision (local path already in)
 - Just run `./finetune.sh`
 
-### Current Issues ⚠️⚠️⚠️
-- [ ] `nan` loss
-
 ### TODOs 🚧🛠️🎯
-- [ ] checkpoints
+- [x] checkpoints
+- [x] compile
 - [ ] better args + config
 - [ ] data parallel
 - [ ] FSDP
