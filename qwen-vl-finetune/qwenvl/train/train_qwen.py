@@ -43,33 +43,57 @@ from enum import Enum
 from torch.distributed import init_process_group
 from torch.utils.data import DataLoader
 from torch.distributed.elastic.multiprocessing.errors import record
+from torch.distributed._composable import replicate
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import Color
 
 
-local_rank = None
-
-LOCAL_BATCH_SIZE = 2
-
-def rank0_print(*args):
-    if local_rank == 0:
-        print(*args)
-
-
-def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
+def save_model(trainer, output_dir):
     """Collects the state dict and dump to disk."""
-
-    if trainer.deepspeed:
-        torch.cuda.synchronize()
-        trainer.save_model(output_dir)
-        return
-
     state_dict = trainer.model.state_dict()
-    if trainer.args.should_save:
-        cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-        del state_dict
-        trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+    cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+    del state_dict
+    step = trainer.step
+
+    checkpoint_dir = os.path.join(output_dir, f"checkpoint-{step:06d}")
+    torch.save(cpu_state_dict, os.path.join(checkpoint_dir, "pytorch_model.bin"))
+
+
+def compile_model(model: torch.nn.Module):
+    model.visual = torch.compile(
+        model.visual, fullgraph=True
+    )
+    model.language_model = torch.compile(
+        model.language_model, fullgraph=True
+    )
+    model.visual.merger = torch.compile(
+        model.visual.merger, fullgraph=True
+    )
+
+    model = torch.compile(
+        model, fullgraph=True
+    ) 
+
+
+def apply_ddp(
+        model,
+        dp_mesh,
+        enable_compile=True,
+        enable_compile_autograd=True,
+):
+    if enable_compile:
+        if enable_compile_autograd:
+            torch._dynamo.config.optimize_ddp = (
+                "python_reducer_without_compiled_forward"
+            )
+        else:
+            torch._dynamo.config.optimize_ddp = "ddp_optimizer"
+
+    replicate(model, dp_mesh, bucket_cap_mb=100)
+
+    logger.info("applied DDP to the model")
 
 
 def set_model(model_args, model):
@@ -98,7 +122,6 @@ def set_model(model_args, model):
 
 
 def loss_fn(pred, labels):
-    print(pred.shape, labels.shape)
     return torch.nn.functional.cross_entropy(
         pred.flatten(0, 1).float(), labels.flatten(0, 1)
     )
@@ -108,15 +131,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     @record
     def __init__(self, *args, **kwargs):
-        self.device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-        world_size = int(os.environ['WORLD_SIZE'])
-
         attn_implementation = "flash_attention_2"
-
         logger.info("starting finetune job")
-        logger.info(f"world size: {world_size}")
 
-        local_rank = int(os.environ['LOCAL_RANK']) 
+        torch.distributed.init_process_group(backend="nccl")
+
+        local_rank = int(os.environ["LOCAL_RANK"])
 
         parser = transformers.HfArgumentParser(
             (ModelArguments, DataArguments, TrainingArguments)
@@ -126,6 +146,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         os.makedirs(training_args.output_dir, exist_ok=True)
 
         self.model, data_args = select_model_class(model_args, data_args, training_args, attn_implementation)
+
+        self.device = torch.device(f"cuda:{local_rank}")
+
+        compile_model(self.model.to(self.device).to(torch.bfloat16))
+        logger.info("model compiled with torch.compile")
 
         self.model_args = model_args
         self.data_args = data_args
@@ -152,36 +177,35 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.sampler = torch.utils.data.distributed.DistributedSampler(
             dataset,
-            num_replicas=world_size,
-            rank=local_rank,
+            num_replicas=torch.distributed.get_world_size(),
+            rank=torch.distributed.get_rank(),
             shuffle=True,
         )
 
         self.data_loader = DataLoader(
             dataset,
-            batch_size=LOCAL_BATCH_SIZE,
+            batch_size=self.training_args.per_device_train_batch_size,
             collate_fn=collator,
             num_workers=64,
             pin_memory=True,
             persistent_workers=True,
-
+            sampler=self.sampler,
         )
 
         self.model.to(self.device)
-
-        #self.model = torch.compile(self.model)
-
-        self.step = 0
-        self.tokens_seen = 0
-        self.ntokens_since_last_log = 0
-        self.time_last_log = time.perf_counter()
-        self.color = Color()
 
         self.optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()),
             lr=training_args.learning_rate,
             weight_decay=training_args.weight_decay,
         )
+
+        self.step = 0
+        self.tokens_seen = 0
+        self.tokens_seen_assistant = 0
+        self.ntokens_since_last_log = 0
+        self.time_last_log = time.perf_counter()
+        self.color = Color()
 
     def batch_generator(self, data_module):
         data_iter = iter(self.data_loader)
@@ -202,6 +226,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             _ = batch.pop("attention_mask", None)
 
             ntokens_batch = labels.numel()
+            ntokens_batch_assistant = (labels != -100).sum().item()
+
+            self.tokens_seen_assistant += ntokens_batch_assistant
             self.tokens_seen += ntokens_batch
             self.ntokens_since_last_log += ntokens_batch
 
@@ -244,7 +271,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
                 loss = outputs.loss
             total_loss = loss / self.training_args.gradient_accumulation_steps
-            loss.backward()
+            total_loss.backward()
 
         if self.training_args.max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(
@@ -265,9 +292,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 self.train_step(data_iterator)
         except Exception as e:
             logger.info(f"exception: {e}")
-
+        except KeyboardInterrupt:
+            logger.info("keyboard interrupt received...")
 
         logger.info(f"tokens seen: {self.tokens_seen}")
+        logger.info(f"assistant tokens seen: {self.tokens_seen_assistant}")
         logger.info("Training completed")
 
 if __name__ == "__main__":

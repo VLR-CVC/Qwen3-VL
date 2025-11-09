@@ -183,7 +183,6 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
 
             messages.append({"role": role, "content": content})
         else:
-            # Assistant messages contain only text
             messages.append({"role": role, "content": [{"type": "text", "text": text}]})
 
     # Check for unused media files
@@ -213,7 +212,6 @@ def preprocess_qwen_visual(
     full_result = processor.apply_chat_template(
         messages, tokenize=True, return_dict=True, return_tensors="pt"
     )
-
     input_ids = full_result["input_ids"]
     if isinstance(input_ids, list):
         input_ids = torch.tensor(input_ids).unsqueeze(0)

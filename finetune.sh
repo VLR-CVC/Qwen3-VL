@@ -11,7 +11,7 @@ NPROC_PER_NODE=$(nvidia-smi --list-gpus | wc -l)  # Automatically detects availa
 # ======================
 # Path Configuration
 # ======================
-MODEL_PATH="Qwen/Qwen3-VL-2B-Instruct"  # [ModelArguments] Pretrained model path
+MODEL_PATH="Qwen/Qwen2.5-VL-3B-Instruct"  # [ModelArguments] Pretrained model path
 OUTPUT_DIR="/data/users/tockier/qwen_finetune/checkpoints"                   # Directory for saving checkpoints
 CACHE_DIR="/data/users/tockier/qwen_finetune/cache"                          # [TrainingArguments] Cache directory for models
 
@@ -38,15 +38,14 @@ torchrun --nproc_per_node=$NGPUS \
          --output_dir $OUTPUT_DIR \
          --cache_dir $CACHE_DIR \
          --bf16 \
-         --per_device_train_batch_size 2 \
-         --gradient_accumulation_steps 1 \
+         --per_device_train_batch_size 1 \
+         --gradient_accumulation_steps 2 \
          --learning_rate 2e-7 \
          --mm_projector_lr 1e-5 \
          --vision_tower_lr 1e-6 \
          --optim adamw_torch \
-         --model_max_length 4096 \
-         --data_flatten True \
-         --data_packing True \
+         --model_max_length 2048 \
+         --data_packing False \
          --max_pixels 451584 \
          --min_pixels 12544 \
          --video_fps 2 \
@@ -56,13 +55,8 @@ torchrun --nproc_per_node=$NGPUS \
          --warmup_ratio 0.03 \
          --lr_scheduler_type "cosine" \
          --weight_decay 0.01 \
-         --logging_steps 2 \
          --save_steps 500 \
          --save_total_limit 3 \
-         --lora_enable True \
-         --lora_r 8 \
-         --lora_alpha 16 \
-         --lora_dropout 0.0 \
 
          # Advanced Options
          #--deepspeed zero3.json \
