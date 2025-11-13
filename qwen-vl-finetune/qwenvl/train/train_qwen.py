@@ -299,7 +299,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 batch = next(data_iter)
 
             except StopIteration:
-                raise Exception("DataLoader ran out of data.")
+                raise StopIteration("DataLoader ran out of data.")
 
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
@@ -395,8 +395,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 if self.may_save():
                     self.save_checkpoint()
 
-        except StopIteration:
-            logger.info("data iterator exhausted...")
+        except StopIteration as e:
+            logger.info(f"data iterator exhausted...: {e}")
         except Exception as e:
             logger.info(f"exception during training: {e}")
         except KeyboardInterrupt:
