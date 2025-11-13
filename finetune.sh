@@ -19,7 +19,9 @@ CACHE_DIR="/data/users/tockier/qwen_finetune/cache"                          # [
 # Model Configuration
 # ======================
 DATASETS="finevision"
-NGPUS=4
+NGPUS=1
+
+DOMAIN_BLACKLIST=github.com,huggingface.co
 
 echo "finetuning qwen vl model from $MODEL_PATH on datasets: $DATASETS"
 

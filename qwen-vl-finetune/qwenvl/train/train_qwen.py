@@ -11,7 +11,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
 from qwenvl.data.data_processor import make_supervised_data_module
-from qwenvl.train.utils import select_model_class
+from qwenvl.train.utils import select_model_class, GarbageCollection
 from qwenvl.train.argument import (
     ModelArguments,
     DataArguments,
@@ -118,14 +118,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
     @record
     def __init__(self, *args, **kwargs):
-        attn_implementation = "flash_attention_2"
+        attn_implementation = None
 
         local_rank = int(os.environ["LOCAL_RANK"])
 
-
         self.mesh = init_device_mesh(
             "cuda",
-            (4,),
+            (1,),
             mesh_dim_names=("shard",),
         )
 
@@ -161,7 +160,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             compile_model(self.model.to(self.device).to(torch.bfloat16))
             logger.info("model compiled with torch.compile")
 
-        if True:
+        if False:
             self.model = FSDP(
                 self.model.to(self.device).to(torch.bfloat16),
                 mesh=self.mesh,
@@ -181,6 +180,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
+            cache_dir=training_args.cache_dir,
         )
 
         set_model(model_args, self.model)
@@ -209,6 +209,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             persistent_workers=True,
             sampler=self.sampler,
             worker_init_fn=random.seed,
+        )
+
+        self.gc_handler = GarbageCollection(
+            gc_freq=10, debug=False
         )
 
         self.step = 0
@@ -384,16 +388,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         try:
             while True:
                 self.step += 1
+                self.gc_handler.run(self.step)
+
                 self.train_step(data_iterator)
 
                 if self.may_save():
                     self.save_checkpoint()
+
         except StopIteration:
             logger.info("data iterator exhausted...")
-
         except Exception as e:
             logger.info(f"exception during training: {e}")
-        
         except KeyboardInterrupt:
             logger.info("keyboard interrupt received...")
 
