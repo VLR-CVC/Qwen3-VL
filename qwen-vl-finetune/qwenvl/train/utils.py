@@ -7,6 +7,7 @@ from transformers import (
 )
 
 import time
+import subprocess
 import gc
 
 from torchtitan.tools.logging import logger
@@ -39,7 +40,10 @@ class GarbageCollection:
         begin = time.monotonic()
         gc.collect(generation)
         logger.info("[GC] %s took %.2f seconds", reason, time.monotonic() - begin)
+        
 
+def get_peak_flops(device_name: str) -> int:
+    return
 
 
 def select_model_class(model_args, data_args, training_args, attn_implementation):

@@ -26,7 +26,9 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed._composable import replicate
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard as FSDP
-import torch.distributed.distributed_c10d as c10d
+from torch.distributed.checkpoint import HuggingFaceStorageWriter
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+
 
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import Color
@@ -124,7 +126,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         self.mesh = init_device_mesh(
             "cuda",
-            (1,),
+            (4,),
             mesh_dim_names=("shard",),
         )
 
@@ -222,8 +224,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.time_last_log = time.perf_counter()
         self.color = Color()
 
+    def rank(self):
+        return torch.distributed.get_rank()
+
     def if_log_rank(self):
-        return torch.distributed.get_rank() == 0
+        return self.rank() == 0
 
     def create_optimizer(self):
         if self.optimizer is not None:
@@ -274,16 +279,39 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     def save_checkpoint(self):
         step = self.step
 
-        checkpoint_dir = os.path.join(self.training_args.output_dir, f"checkpoint-{step:06d}")
-        if not os.path.exists(checkpoint_dir):
-            pathlib.Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = os.path.join(
+            self.training_args.output_dir,
+            f"checkpoint-step-{step}",
+        )
+        state_dict = {"model": self.model}
 
-        weights_path = os.path.join(checkpoint_dir, "model.pt")
+        try:
+            logger.info(f"checkpointing at {checkpoint_dir}")
+            torch.distributed.checkpoint.save(
+                state_dict=state_dict,
+                checkpoint_id=checkpoint_dir,
+            )
+        except Exception as e:
+            logger.info(f"rank: {self.rank()}")
+            logger.info(f"exception during checkpointing: {e}")
+        else:
+            if self.if_log_rank():
+                logger.info(f"checkpoint at step {step} saved.")
+            
+    def state_dict(self):
+        model_state, optimizer_state, = get_state_dict(self.model, self.optimizer)
+        return {
+            "model": model_state,
+            "optimizer": optimizer_state,
+        }
 
-        state_dict = self.model.state_dict()
-        torch.save(state_dict, weights_path)
-
-        logger.info(f"Saved checkpoint to {checkpoint_dir}")
+    def load_state_dict(self, state_dict):
+        set_state_dict(
+            self.model,
+            self.optimizer,
+            model_state_dict=state_dict["model"],
+            optimizer_state_dict=state_dict["optimizer"],
+        )
 
     def may_save(self):
         if self.step % self.training_args.save_steps == 0:
@@ -379,7 +407,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         if self.if_log_rank():
             self.log(loss.item())
-
 
     def train(self):
         data_iterator = self.batch_generator(self.data_module)

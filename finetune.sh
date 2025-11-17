@@ -19,7 +19,8 @@ CACHE_DIR="/data/users/tockier/qwen_finetune/cache"                          # [
 # Model Configuration
 # ======================
 DATASETS="finevision"
-NGPUS=1
+NGPUS=4
+NCCL_P2P_DISABLE=2
 
 DOMAIN_BLACKLIST=github.com,huggingface.co
 
@@ -51,7 +52,7 @@ torchrun --nproc_per_node=$NGPUS \
          --max_pixels 451584 \
          --min_pixels 12544 \
          --weight_decay 0.01 \
-         --save_steps 100 \
+         --save_steps 10 \
          --save_total_limit 3 \
 
          # Advanced Options
