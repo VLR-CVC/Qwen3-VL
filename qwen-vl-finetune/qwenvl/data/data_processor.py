@@ -209,6 +209,7 @@ def preprocess_qwen_visual(
     base_path = Path(source.get("data_path", ""))
     messages = _build_messages(source, base_path)
 
+    # IMAGE PROCESSING HAPPENS HERE
     full_result = processor.apply_chat_template(
         messages, tokenize=True, return_dict=True, return_tensors="pt"
     )
@@ -353,7 +354,10 @@ class LazySupervisedDataset(Dataset):
                 sources = self.list_data_dict[i]
                 if isinstance(sources, dict):
                     sources = [sources]
+                
+                # we are using this
                 sample = self.item_fn(sources)
+                # shape images: (H, W) ????
                 return sample
             except Exception as e:
                 # sleep 1s in case it is a cloud disk issue

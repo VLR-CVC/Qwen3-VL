@@ -2,8 +2,8 @@ import re
 
 # Define placeholders for dataset paths
 FINEVISION = {
-    "annotation_path": "/data-net/storage/datasets/new_finevision_debug/converted_dataset.jsonl",
-    "data_path": "/data-net/storage/datasets/new_finevision_debug/images/",
+    "annotation_path": "/data-net/storage/users/tockier/data_scripts/reformatted_data.jsonl",
+    "data_path": "/data-net/storage/users/tockier/data_scripts/reformatted_images/",
 }
 
 FINEVISION_MN5 = {
