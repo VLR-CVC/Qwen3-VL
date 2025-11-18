@@ -15,7 +15,7 @@ def select_model_class(model_args, data_args, training_args, attn_implementation
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
+            #attn_implementation=attn_implementation,
             dtype=(torch.bfloat16 if training_args.bf16 else None),
         )
         data_args.model_type = "qwen3vl"
@@ -24,7 +24,7 @@ def select_model_class(model_args, data_args, training_args, attn_implementation
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
+            #attn_implementation=attn_implementation,
             dtype=(torch.bfloat16 if training_args.bf16 else None),
         )
         data_args.model_type = "qwen2.5vl"
@@ -33,7 +33,7 @@ def select_model_class(model_args, data_args, training_args, attn_implementation
         model = Qwen2VLForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
+            #attn_implementation=attn_implementation,
             dtype=(torch.bfloat16 if training_args.bf16 else None),
         )
         data_args.model_type = "qwen2vl"
@@ -42,7 +42,7 @@ def select_model_class(model_args, data_args, training_args, attn_implementation
         model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
+            #attn_implementation=attn_implementation,
             dtype=(torch.bfloat16 if training_args.bf16 else None),
         )
         data_args.model_type = "qwen3vl"
